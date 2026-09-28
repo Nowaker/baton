@@ -6,6 +6,8 @@ mod canonical;
 mod config;
 mod convert;
 mod detect;
+#[cfg(target_os = "macos")]
+mod desktop;
 mod formats;
 mod pick;
 
@@ -45,6 +47,9 @@ enum Cmd {
         /// After writing, run the target agent's own import command (e.g. `opencode import`).
         #[arg(long)]
         import: bool,
+        /// Also register in Claude Desktop's Code tab (macOS, requires --to claude-code --import).
+        #[arg(long, requires = "import")]
+        desktop: bool,
         /// Use the source agent's most recently modified session (skips the picker).
         #[arg(long, conflicts_with = "input")]
         latest: bool,
@@ -87,15 +92,22 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             import,
+            desktop,
             latest,
             compress,
         } => {
+            if desktop {
+                anyhow::ensure!(to == Agent::ClaudeCode, "--desktop requires --to claude-code");
+                anyhow::ensure!(cfg!(target_os = "macos"), "--desktop is supported only on macOS");
+            }
             let input = match input {
                 Some(p) => p,
                 None => pick::resolve_input(from, latest)?,
             };
             let out = convert::convert(from, to, &input, output.as_deref(), compress)?;
-            if import {
+            if desktop {
+                convert::import_to_desktop(&out)?;
+            } else if import {
                 convert::import_to_target(to, &out)?;
             }
         }
