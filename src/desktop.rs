@@ -69,16 +69,15 @@ impl<'a> Registration<'a> {
 }
 
 pub fn account_scopes(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !root.try_exists()? {
+        return Ok(Vec::new());
+    }
     let mut scopes = Vec::new();
     for account in uuid_directories(root)
         .context("finding Claude Desktop accounts; open Desktop and sign in first")?
     {
         scopes.extend(uuid_directories(&account)?);
     }
-    anyhow::ensure!(
-        !scopes.is_empty(),
-        "no Claude Desktop account/org directories; open Desktop and sign in first"
-    );
     Ok(scopes)
 }
 
