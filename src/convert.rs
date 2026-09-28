@@ -96,7 +96,7 @@ pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Agent::ClaudeCode => import_claude(file).map(|_| ()),
+        Agent::ClaudeCode => import_claude(file),
         Agent::Codex => import_codex(file),
         other => anyhow::bail!("no auto-import path for {other} yet"),
     }
@@ -114,7 +114,7 @@ pub fn opencode_session_directory(file: &Path) -> Option<std::path::PathBuf> {
 
 /// Place a converted .jsonl where Claude Code will find it:
 /// `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, resumable via `claude --resume <uuid>`.
-fn import_claude(file: &Path) -> anyhow::Result<(String, std::path::PathBuf)> {
+fn import_claude(file: &Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("reading {}", file.display()))?;
 
@@ -163,27 +163,19 @@ fn import_claude(file: &Path) -> anyhow::Result<(String, std::path::PathBuf)> {
         "open it with: claude --resume {id}   (from {})",
         cwd.display()
     );
-    Ok((id, cwd))
-}
-
-pub fn import_to_desktop(file: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let root = dirs::home_dir().context("no home dir")?
             .join("Library/Application Support/Claude/claude-code-sessions");
         let scopes = crate::desktop::account_scopes(&root)?;
-        let session = formats::read(Agent::ClaudeCode, file)?;
-        let (id, cwd) = import_claude(file)?;
-        let entry = crate::desktop::Registration::new(&id, &cwd, &session)?;
-        let count = crate::desktop::register(&scopes, &entry)?;
-        eprintln!("registered in {count} Claude Desktop account/org directories; restart Claude Desktop to load the session in its Code tab");
-        Ok(())
+        if !scopes.is_empty() {
+            let session = formats::read(Agent::ClaudeCode, file)?;
+            let entry = crate::desktop::Registration::new(&id, &cwd, &session)?;
+            let count = crate::desktop::register(&scopes, &entry)?;
+            eprintln!("registered in {count} Claude Desktop account/org directories; restart Claude Desktop to load the session in its Code tab");
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = file;
-        anyhow::bail!("--desktop is supported only on macOS")
-    }
+    Ok(())
 }
 
 /// Place a converted rollout where codex will find it:

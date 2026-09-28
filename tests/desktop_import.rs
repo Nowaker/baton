@@ -54,7 +54,7 @@ impl Drop for Sandbox {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn registers_in_every_scope_when_desktop_is_requested() {
+fn registers_in_every_scope_when_claude_code_is_imported() {
     // Given two account/org scopes, including one with scheduled tasks only.
     let home = Sandbox::new();
     let first = home.scope(
@@ -68,7 +68,7 @@ fn registers_in_every_scope_when_desktop_is_requested() {
     std::fs::create_dir(second.join("scheduled-tasks")).unwrap();
     std::fs::write(first.join("existing.json"), "do not read or modify").unwrap();
     // When importing through the real CLI.
-    let output = home.convert(&["--import", "--desktop"]);
+    let output = home.convert(&["--import"]);
     // Then each scope links to the installed transcript, without inherited secrets.
     assert!(
         output.status.success(),
@@ -125,39 +125,39 @@ fn registers_in_every_scope_when_desktop_is_requested() {
 }
 
 #[test]
-fn rejects_desktop_when_import_is_missing() {
-    // Given an explicit fixture input, when Desktop is requested without --import.
+fn converts_without_registration_when_import_is_missing() {
+    // Given an explicit fixture input, when conversion is requested without --import.
     let home = Sandbox::new();
-    let output = home.convert(&["--desktop"]);
-    // Then argument validation rejects it before producing output.
-    assert!(!output.status.success());
-    assert!(!home.0.join("output.jsonl").exists());
+    let output = home.convert(&[]);
+    // Then only the converted output is created.
+    assert!(output.status.success());
+    assert!(home.0.join("output.jsonl").exists());
+    assert!(!home.0.join(".claude").exists());
 }
 
 #[test]
-fn leaves_desktop_untouched_when_only_cli_import_is_requested() {
+fn leaves_desktop_untouched_when_only_conversion_is_requested() {
     // Given an existing Desktop scope.
     let home = Sandbox::new();
     let scope = home.scope(
         "11111111-1111-4111-8111-111111111111",
         "22222222-2222-4222-8222-222222222222",
     );
-    // When using the existing CLI-only import.
-    let output = home.convert(&["--import"]);
+    // When converting without importing.
+    let output = home.convert(&[]);
     // Then no Desktop registration is added.
     assert!(output.status.success());
     assert_eq!(std::fs::read_dir(scope).unwrap().count(), 0);
 }
 
 #[test]
-fn fails_before_import_when_desktop_is_unavailable() {
-    // Given no Desktop account/org directories (or an unsupported OS).
+fn imports_cli_when_desktop_is_unavailable() {
+    // Given no Desktop account/org directories.
     let home = Sandbox::new();
-    // When requesting Desktop import.
-    let output = home.convert(&["--import", "--desktop"]);
-    // Then no misleading CLI-only import is left behind.
-    assert!(!output.status.success());
-    assert!(!home.0.join(".claude").exists());
+    // When importing normally, then the CLI transcript remains available.
+    let output = home.convert(&["--import"]);
+    assert!(output.status.success());
+    assert!(home.0.join(".claude/projects").is_dir());
 }
 
 #[test]
@@ -187,7 +187,6 @@ fn links_existing_transcript_when_source_uuid_is_compact() {
             "--output",
             "output.jsonl",
             "--import",
-            "--desktop",
         ])
         .output()
         .unwrap();

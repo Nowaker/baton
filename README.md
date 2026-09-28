@@ -74,7 +74,7 @@ You never have to hunt these down (`--latest` and the interactive picker find th
 
 | Agent | Read | Write | Auto-import |
 |---|:---:|:---:|:---:|
-| Claude Code | ✅ | ✅ | ✅ `--import`; macOS Desktop: add `--desktop` |
+| Claude Code | ✅ | ✅ | ✅ `--import` (also registers in macOS Desktop when present) |
 | OpenCode | ✅ | ✅ | ✅ `opencode import` |
 | Codex CLI | ✅ | ✅ | — |
 | Gemini CLI | ✅ | ✅ | — |
@@ -90,11 +90,11 @@ You never have to hunt these down (`--latest` and the interactive picker find th
 
 ### Claude Desktop's Code tab (macOS)
 
-To register a converted Claude Code session in Desktop as well as the CLI:
+Claude Code imports automatically register in Desktop as well as the CLI on macOS:
 
 ```sh
 # Run from the project directory where you will continue the session.
-baton convert --from opencode --to claude-code session.json --import --desktop
+baton convert --from opencode --to claude-code session.json --import
 ```
 
 Sign in to Claude Desktop first, then fully quit and restart it after importing.
@@ -103,6 +103,8 @@ account/organization's sessions. Baton registers in **every existing** UUID
 account/organization directory under
 `~/Library/Application Support/Claude/claude-code-sessions/`, including empty
 directories and those containing only scheduled tasks. It does not create accounts.
+If Desktop has no account/organization directories, the CLI import still succeeds.
+The MCP `import_to_target` tool uses the same automatic registration behavior.
 
 Each new `local_<uuid>.json` links to the imported CLI transcript in
 `~/.claude/projects/<encoded-cwd>/<cliSessionId>.jsonl`. Registrations use mode
@@ -112,11 +114,12 @@ registrations use the default model and permissions, high effort, browser
 permission mode `ask`, and no inherited tool approvals. Desktop's completed-turn
 counter starts at zero.
 
-This is an opt-in integration with the on-disk schema observed in Claude Desktop
+This integration uses the on-disk schema observed in Claude Desktop
 2.9939.2, not an official import API. Windows paths and other Desktop versions
 are not verified. A repeated import creates a fresh Desktop registration; it does
-not deduplicate existing Desktop sessions. Without `--desktop`, CLI and MCP imports
-keep their existing behavior. If a write fails after the CLI import, its transcript
+not deduplicate existing Desktop sessions. Conversion without importing does not
+register anything. On other operating systems, imports remain CLI-only.
+If a registration write fails after the CLI import, its transcript
 and any successfully registered scopes remain available. Fixture tests verify the
 registration files and CLI links, not the Desktop application's rendering.
 

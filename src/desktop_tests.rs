@@ -95,3 +95,18 @@ fn preserves_cli_filename_spelling_when_uuid_is_not_hyphenated() {
     let entry = Registration::new(id, Path::new("/fixture"), &session).unwrap();
     assert_eq!(serde_json::to_value(entry).unwrap()["cliSessionId"], id);
 }
+
+#[test]
+fn skips_registration_when_desktop_directory_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let scopes = account_scopes(&temp.path().join("absent")).unwrap();
+    assert!(scopes.is_empty());
+}
+
+#[test]
+fn skips_registration_when_account_has_no_org_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join(Uuid::new_v4().to_string())).unwrap();
+    let scopes = account_scopes(temp.path()).unwrap();
+    assert!(scopes.is_empty());
+}
