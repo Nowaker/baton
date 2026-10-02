@@ -113,6 +113,7 @@ impl Format for ClaudeCode {
             time_created: first_ts.unwrap_or(0),
             time_updated: last_ts,
             directory,
+            title_prefix: None,
             messages,
         };
         session.title = match custom_title.or(ai_title) {
@@ -599,6 +600,7 @@ mod tests {
             time_created: 1000,
             time_updated: 1000,
             directory: None,
+            title_prefix: None,
             messages: vec![Message {
                 role: Role::User,
                 parts: vec![
@@ -648,6 +650,7 @@ mod tests {
             time_created: 1000,
             time_updated: 2000,
             directory: Some("/tmp".into()),
+            title_prefix: None,
             messages: vec![
                 Message {
                     role: Role::User,

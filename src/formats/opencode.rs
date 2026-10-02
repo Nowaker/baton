@@ -119,6 +119,7 @@ impl Format for Opencode {
             time_created: info.time.created.unwrap_or(0),
             time_updated: info.time.updated.unwrap_or(0),
             directory: Some(info.directory.clone()),
+            title_prefix: None,
             messages,
         })
     }
@@ -150,8 +151,9 @@ impl Format for Opencode {
         // live ones, the loop never exits, and opencode re-requests with the
         // conversation ending on an assistant message -> Anthropic 400
         // "does not support assistant message prefill".
-        let mut ids = IdGen::new(now);
-        let session_id = ids.next("ses", session.time_created.max(0));
+        let seed = format!("{}:{}", session.origin, session.source_id);
+        let mut ids = IdGen::new(now, &seed);
+        let session_id = IdGen::session_id(&seed);
         let slug = slugify(&session.title);
 
         let mut out_messages = Vec::with_capacity(session.messages.len());
@@ -261,7 +263,7 @@ impl Format for Opencode {
                     Part::ToolCall { name, id, input } => {
                         let call_id = id
                             .clone()
-                            .unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().simple().to_string()[..16]));
+                            .unwrap_or_else(|| format!("call_{}", &part_id[part_id.len() - 16..]));
                         let input = input
                             .clone()
                             .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -415,7 +417,14 @@ impl Format for Opencode {
                 "projectID": repo.as_ref().and_then(|r| r.root_commit.clone()).unwrap_or_else(|| "global".to_string()),
                 "directory": directory,
                 "path": repo.as_ref().map(|r| r.relative_path.clone()).unwrap_or_default(),
-                "title": format!("[{}] {}", session.origin, session.title),
+                "title": format!(
+                    "{}{}",
+                    session
+                        .title_prefix
+                        .clone()
+                        .unwrap_or_else(|| format!("[{}] ", session.origin)),
+                    session.title
+                ),
                 "agent": "build",
                 "model": { "id": session_model.id, "providerID": session_model.provider },
                 "version": env!("CARGO_PKG_VERSION"),
@@ -782,6 +791,7 @@ mod tests {
             time_created: 1000,
             time_updated: 2000,
             directory: Some("/tmp".into()),
+            title_prefix: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -904,6 +914,7 @@ mod tests {
             time_created: 1000,
             time_updated: 2000,
             directory: Some(directory.into()),
+            title_prefix: None,
             messages,
         }
     }
@@ -1083,6 +1094,7 @@ mod tests {
             time_created: 1000,
             time_updated: 1004,
             directory: Some("/tmp".into()),
+            title_prefix: None,
             messages: vec![
                 message(
                     Role::User,
@@ -1179,6 +1191,7 @@ mod tests {
             time_created: 1000,
             time_updated: 1000,
             directory: Some("/repo".into()),
+            title_prefix: None,
             messages: vec![
                 message(
                     Role::Assistant,
@@ -1259,6 +1272,7 @@ mod tests {
             time_created: 1000,
             time_updated: 1000,
             directory: None,
+            title_prefix: None,
             messages: vec![Message {
                 role: Role::Assistant,
                 parts: vec![Part::ToolCall {
@@ -1289,6 +1303,30 @@ mod tests {
     }
 
     #[test]
+    fn write_is_deterministic_and_honours_the_title_prefix() {
+        let mut session = session_in(
+            "/nonexistent/baton-dir",
+            vec![
+                message(Role::User, "q", None),
+                message(Role::Assistant, "a", Some(opus())),
+            ],
+        );
+        let first = write_export(&session, "det-1");
+        let again = write_export(&session, "det-2");
+        assert_eq!(first["info"]["id"], again["info"]["id"]);
+        assert_eq!(first["messages"], again["messages"], "same ids on every conversion");
+        assert!(first["info"]["id"].as_str().unwrap().starts_with("ses_"));
+        assert_eq!(first["info"]["id"].as_str().unwrap().len(), "ses_".len() + 26);
+
+        session.source_id = "other".into();
+        session.title_prefix = Some("[import:roo] ".into());
+        let other = write_export(&session, "det-3");
+        assert_ne!(other["info"]["id"], first["info"]["id"]);
+        assert_ne!(other["messages"][0]["info"]["id"], first["messages"][0]["info"]["id"]);
+        assert_eq!(other["info"]["title"], "[import:roo] Real title");
+    }
+
+    #[test]
     fn slugify_basics() {
         assert_eq!(slugify("Hello, World!"), "hello--world");
         assert_eq!(slugify(""), "imported");
@@ -1309,6 +1347,11 @@ mod tests {
 /// outranks the live conversation. opencode then never exits its run loop and
 /// re-requests with the conversation ending on an assistant message, which
 /// Anthropic rejects ("does not support assistant message prefill").
+///
+/// The 14 trailing characters are derived from `seed` and the emission count
+/// rather than drawn at random, so converting the same source session again
+/// yields the same ids, and `opencode import` (which skips rows it already has)
+/// leaves an earlier import untouched instead of duplicating every message.
 struct IdGen {
     last_timestamp: i64,
     counter: u64,
@@ -1316,6 +1359,8 @@ struct IdGen {
     /// mint at this instant, so an imported message can never outrank the live conversation when the
     /// session is resumed (resume happens strictly after import). See `next`.
     now_ceiling: i64,
+    seed: String,
+    emitted: u64,
 }
 
 impl IdGen {
@@ -1329,8 +1374,29 @@ impl IdGen {
     /// ends at `now_ceiling`, so it can never wrap back above a resume-time native id.
     const WRAP_MS: i64 = 1 << 36;
 
-    fn new(now_ceiling: i64) -> Self {
-        Self { last_timestamp: -1, counter: 0, now_ceiling }
+    fn new(now_ceiling: i64, seed: &str) -> Self {
+        Self { last_timestamp: -1, counter: 0, now_ceiling, seed: seed.to_string(), emitted: 0 }
+    }
+
+    /// 14 base62 characters determined by `name` alone.
+    fn stable_chars(name: &str) -> String {
+        let a = Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes());
+        let b = Uuid::new_v5(&a, b"baton");
+        a.as_bytes()
+            .iter()
+            .chain(b.as_bytes())
+            .take(14)
+            .map(|b| Self::CHARS[(*b as usize) % 62] as char)
+            .collect()
+    }
+
+    /// opencode session id for a source session, stable across conversions, so
+    /// a session can be referenced (as a subtask's parent, say) from another
+    /// conversion without knowing anything about it but its source id.
+    fn session_id(seed: &str) -> String {
+        let hash = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("session:{seed}").as_bytes());
+        let hex: String = hash.as_bytes()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!("ses_{hex}{}", Self::stable_chars(&format!("session:{seed}")))
     }
 
     /// opencode's 12-hex, time-sortable prefix for an already-combined `timestamp_ms * 0x1000 + counter`.
@@ -1372,10 +1438,8 @@ impl IdGen {
         out.push_str(prefix);
         out.push('_');
         out.push_str(&Self::encode_prefix(current));
-        let bytes = Uuid::new_v4();
-        for b in bytes.as_bytes().iter().take(14) {
-            out.push(Self::CHARS[(*b as usize) % 62] as char);
-        }
+        self.emitted += 1;
+        out.push_str(&Self::stable_chars(&format!("{}:{prefix}:{}", self.seed, self.emitted)));
         out
     }
 
@@ -1395,7 +1459,7 @@ mod idgen_tests {
     #[test]
     fn ids_sort_chronologically_and_monotonically() {
         // Ceiling above the timestamps used, so the wrap-clamp doesn't interfere with this test.
-        let mut g = IdGen::new(1_700_000_002_000);
+        let mut g = IdGen::new(1_700_000_002_000, "test");
         let a = g.next("msg", 1_700_000_000_000);
         let b = g.next("msg", 1_700_000_000_000); // same ms
         let c = g.next("msg", 1_700_000_001_000); // later
@@ -1415,7 +1479,7 @@ mod idgen_tests {
         // mid-window and compare against a real native-style id built with the same 48-bit truncation.
         const WRAP: i64 = 1 << 36;
         let now = 100 * WRAP + WRAP / 2; // mid wrap-window, far from any boundary
-        let mut g = IdGen::new(now);
+        let mut g = IdGen::new(now, "test");
         // An id from a PREVIOUS wrap window (which naively sorts ABOVE `now`) must be clamped below it.
         let ancient = g.next("msg", now - 3 * WRAP - 5_000);
         let recent = g.next("msg", now - 60_000); // within the current window
