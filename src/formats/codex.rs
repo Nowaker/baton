@@ -191,6 +191,7 @@ impl Format for Codex {
                 time_created: line_ts,
                 origin: Some(Agent::Codex),
                 model: None,
+                summary: false,
             });
         }
 
@@ -214,6 +215,8 @@ impl Format for Codex {
             time_updated: last_ts,
             directory,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         })
     }
@@ -420,6 +423,8 @@ mod tests {
             time_updated: 0,
             directory: None,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -427,6 +432,7 @@ mod tests {
                     time_created: 0,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -448,6 +454,7 @@ mod tests {
                     time_created: 1,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
             ],
         };
