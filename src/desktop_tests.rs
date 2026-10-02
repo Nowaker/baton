@@ -10,6 +10,8 @@ fn session() -> Session {
         time_updated: 1_700_000_001_000,
         directory: None,
         title_prefix: None,
+        parent: None,
+        children: Vec::new(),
         messages: Vec::new(),
     }
 }

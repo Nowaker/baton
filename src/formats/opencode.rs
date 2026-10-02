@@ -109,6 +109,7 @@ impl Format for Opencode {
                 time_created: ts,
                 origin: Some(Agent::Opencode),
                 model: msg.info.model_ref(),
+                summary: false,
             });
         }
 
@@ -120,6 +121,8 @@ impl Format for Opencode {
             time_updated: info.time.updated.unwrap_or(0),
             directory: Some(info.directory.clone()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         })
     }
@@ -168,11 +171,39 @@ impl Format for Opencode {
         // that never produced anything.
         let mut context_tokens: u64 = 0;
         let mut total_output: u64 = 0;
+        let mut spawned = session.children.iter();
         for (msg, model) in session.messages.iter().zip(&models) {
-            let msg_id = ids.next("msg", msg.time_created.max(0));
             let ts = msg.time_created;
             let model = model.clone().unwrap_or_else(|| session_model.clone());
-            let msg_info: serde_json::Value = match msg.role {
+            // opencode's own form of a context summary: a user message holding a
+            // compaction part, answered by an assistant message flagged `summary`.
+            // `MessageV2.filterCompacted` then replays only the summary and what
+            // follows it, as the source agent did.
+            if msg.summary {
+                let compaction_id = ids.next("msg", ts.max(0));
+                out_messages.push(serde_json::json!({
+                    "info": {
+                        "id": compaction_id,
+                        "sessionID": session_id,
+                        "role": "user",
+                        "time": { "created": ts },
+                        "agent": "build",
+                        "model": { "providerID": model.provider, "modelID": model.id },
+                    },
+                    "parts": [{
+                        "type": "compaction",
+                        "auto": true,
+                        "id": ids.next("prt", ts.max(0)),
+                        "sessionID": session_id,
+                        "messageID": compaction_id,
+                    }],
+                }));
+                prev_id = Some(compaction_id);
+                context_tokens = 0;
+            }
+            let msg_id = ids.next("msg", msg.time_created.max(0));
+            let role = if msg.summary { Role::Assistant } else { msg.role };
+            let msg_info: serde_json::Value = match role {
                 // opencode only accepts user/assistant; system messages are written as
                 // user with a "[system] " text prefix (recovered on read).
                 Role::User | Role::System => serde_json::json!({
@@ -187,11 +218,20 @@ impl Format for Opencode {
                     let pid = prev_id.clone().unwrap_or_else(|| msg_id.clone());
                     let out_tok = estimate_tokens(&msg.parts);
                     total_output += out_tok;
-                    serde_json::json!({
+                    // opencode only checks a session's size against the model's
+                    // context before prompting when the last reply is finished
+                    // (`MessageV2.latest`); without `finish` an import too large for
+                    // the model is sent whole and rejected instead of compacted.
+                    let finish = match msg.parts.last() {
+                        Some(Part::ToolCall { .. }) => "tool-calls",
+                        _ => "stop",
+                    };
+                    let mut info = serde_json::json!({
                         "id": msg_id,
                         "sessionID": session_id,
                         "role": "assistant",
                         "time": { "created": ts, "completed": ts + 1 },
+                        "finish": finish,
                         "parentID": pid,
                         "modelID": model.id,
                         "providerID": model.provider,
@@ -205,7 +245,14 @@ impl Format for Opencode {
                             "reasoning": 0,
                             "cache": { "read": 0, "write": 0 }
                         },
-                    })
+                    });
+                    if msg.summary {
+                        info["summary"] = serde_json::json!(true);
+                        info["finish"] = serde_json::json!("stop");
+                        info["mode"] = serde_json::json!("compaction");
+                        info["agent"] = serde_json::json!("compaction");
+                    }
+                    info
                 }
             };
             context_tokens += estimate_tokens(&msg.parts);
@@ -269,6 +316,18 @@ impl Format for Opencode {
                             .unwrap_or(serde_json::Value::Object(Default::default()));
                         let tool = match msg.origin.unwrap_or(session.origin) {
                             Agent::ClaudeCode => native_tool(name, input),
+                            Agent::Cline => {
+                                let mut tool =
+                                    cline_tool(name, input, session.directory.as_deref());
+                                if tool.name == "task"
+                                    && let Some(child) = spawned.next()
+                                {
+                                    tool.metadata["sessionId"] = serde_json::json!(
+                                        IdGen::session_id(&format!("{}:{child}", session.origin))
+                                    );
+                                }
+                                tool
+                            }
                             _ => NativeTool {
                                 name: name.clone(),
                                 title: name.clone(),
@@ -312,13 +371,18 @@ impl Format for Opencode {
                                         .and_then(|ps| ps.get_mut(pi))
                                 };
                                 if let Some(part) = target {
-                                    let is_bash = part["tool"] == "bash";
+                                    let tool = part["tool"].as_str().unwrap_or_default().to_string();
                                     let state = &mut part["state"];
                                     state["output"] = serde_json::json!(out_text);
                                     // opencode's bash view renders the command's output from
                                     // its metadata, not from `state.output`.
-                                    if is_bash {
+                                    if tool == "bash" {
                                         state["metadata"]["output"] = serde_json::json!(out_text);
+                                    }
+                                    // ...and its question view the answers.
+                                    if tool == "question" {
+                                        state["metadata"]["answers"] =
+                                            serde_json::json!([[question_answer(&out_text)]]);
                                     }
                                     if errored {
                                         state["status"] = serde_json::json!("error");
@@ -410,7 +474,7 @@ impl Format for Opencode {
             prev_id = Some(msg_id);
         }
 
-        let export = serde_json::json!({
+        let mut export = serde_json::json!({
             "info": {
                 "id": session_id,
                 "slug": slug,
@@ -443,6 +507,10 @@ impl Format for Opencode {
             },
             "messages": out_messages,
         });
+        if let Some(parent) = &session.parent {
+            export["info"]["parentID"] =
+                serde_json::json!(IdGen::session_id(&format!("{}:{parent}", session.origin)));
+        }
 
         let pretty = serde_json::to_string_pretty(&export)?;
         std::fs::write(out_path, pretty)
@@ -533,6 +601,360 @@ fn native_tool(name: &str, input: serde_json::Value) -> NativeTool {
         title,
         metadata,
     }
+}
+
+/// Map a Cline-family (Cline, Roo Code, Kilo Code, Zoo Code) tool call onto
+/// the opencode tool that does the same job, so opencode renders it with that
+/// tool's view. Relative paths are resolved against the session directory, as
+/// the agent resolved them against its workspace. Tools opencode has no
+/// equivalent for, and calls whose input does not fit one, keep their name and
+/// input.
+fn cline_tool(name: &str, input: serde_json::Value, directory: Option<&str>) -> NativeTool {
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let path = |p: &str| resolve_path(p, directory);
+    let native = |native: &str, title: Option<String>, input, metadata| NativeTool {
+        name: native.to_string(),
+        title: title.unwrap_or_else(|| native.to_string()),
+        input,
+        metadata,
+    };
+    let edit = |file: String, blocks: Vec<(usize, String, String)>, original_diff: Option<String>| {
+        let diff = unified_diff(&file, &blocks);
+        let input = match (blocks.as_slice(), original_diff) {
+            ([(_, old, new)], _) => {
+                serde_json::json!({ "filePath": file, "oldString": old, "newString": new })
+            }
+            (_, diff) => serde_json::json!({ "filePath": file, "diff": diff }),
+        };
+        native("edit", Some(file), input, serde_json::json!({ "diff": diff }))
+    };
+    let tool = match name {
+        "execute_command" => field("command").map(|command| {
+            let mut input = serde_json::json!({ "command": command });
+            if let Some(cwd) = field("cwd").filter(|c| !c.is_empty()) {
+                input["workdir"] = serde_json::json!(path(&cwd));
+            }
+            native("bash", Some(command), input, serde_json::json!({}))
+        }),
+        "read_file" => match cline_file_paths(&input).as_slice() {
+            [file] => {
+                let file = path(file);
+                Some(native("read", Some(file.clone()), serde_json::json!({ "filePath": file }), serde_json::json!({})))
+            }
+            _ => None,
+        },
+        "write_to_file" => field("path").map(|file| {
+            let file = path(&file);
+            let input = serde_json::json!({ "filePath": file, "content": field("content").unwrap_or_default() });
+            native("write", Some(file), input, serde_json::json!({}))
+        }),
+        "apply_diff" | "replace_in_file" => match (cline_file_paths(&input).as_slice(), cline_diff(&input)) {
+            ([file], Some(diff)) => {
+                let blocks = search_replace_blocks(&diff);
+                (!blocks.is_empty()).then(|| edit(path(file), blocks, Some(diff)))
+            }
+            _ => None,
+        },
+        "search_and_replace" | "edit" | "edit_file" => {
+            let file = field("path").or_else(|| field("file_path"));
+            let old = field("search").or_else(|| field("old_string"));
+            let new = field("replace").or_else(|| field("new_string"));
+            match (file, old, new) {
+                (Some(file), Some(old), Some(new)) => Some(edit(path(&file), vec![(1, old, new)], None)),
+                _ => None,
+            }
+        }
+        "search_files" => field("regex").map(|pattern| {
+            let mut input = serde_json::json!({ "pattern": pattern });
+            if let Some(dir) = field("path") {
+                input["path"] = serde_json::json!(path(&dir));
+            }
+            if let Some(include) = field("file_pattern") {
+                input["include"] = serde_json::json!(include);
+            }
+            native("grep", Some(pattern), input, serde_json::json!({}))
+        }),
+        "update_todo_list" => field("todos").map(|list| {
+            let todos = cline_todos(&list);
+            let open = todos.iter().filter(|t| t["status"] != "completed").count();
+            native(
+                "todowrite",
+                Some(format!("{open} todos")),
+                serde_json::json!({ "todos": todos }),
+                serde_json::json!({ "todos": todos }),
+            )
+        }),
+        "ask_followup_question" => field("question").map(|question| {
+            let options: Vec<serde_json::Value> = match input.get("follow_up") {
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|i| i.get("text").and_then(|t| t.as_str()).or(i.as_str()))
+                    .map(|label| serde_json::json!({ "label": label, "description": "" }))
+                    .collect(),
+                Some(serde_json::Value::String(xml)) => xml_values(xml, "suggest")
+                    .into_iter()
+                    .map(|label| serde_json::json!({ "label": label, "description": "" }))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let input = serde_json::json!({ "questions": [{
+                "question": question,
+                "header": "Question",
+                "options": options,
+            }]});
+            native("question", None, input, serde_json::json!({}))
+        }),
+        "new_task" => field("message").map(|prompt| {
+            let description: String = prompt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("subtask")
+                .chars()
+                .take(60)
+                .collect();
+            let input = serde_json::json!({
+                "description": description,
+                "prompt": prompt,
+                "subagent_type": field("mode").unwrap_or_else(|| "general".to_string()),
+            });
+            native("task", Some(description), input, serde_json::json!({}))
+        }),
+        "use_mcp_tool" => match (field("server_name"), field("tool_name")) {
+            (Some(server), Some(tool)) => {
+                let arguments = match input.get("arguments") {
+                    Some(serde_json::Value::String(raw)) => serde_json::from_str(raw)
+                        .ok()
+                        .filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({ "arguments": raw })),
+                    Some(args @ serde_json::Value::Object(_)) => args.clone(),
+                    _ => serde_json::json!({}),
+                };
+                let name = mcp_tool_name(&server, &tool);
+                Some(native(&name, None, arguments, serde_json::json!({})))
+            }
+            _ => None,
+        },
+        _ => name.strip_prefix("mcp--").and_then(|rest| {
+            let (server, tool) = rest.split_once("--")?;
+            let decode = |s: &str| s.replace("___", "-");
+            let name = mcp_tool_name(&decode(server), &decode(tool));
+            Some(native(&name, None, input.clone(), serde_json::json!({})))
+        }),
+    };
+    tool.unwrap_or_else(|| NativeTool {
+        name: name.to_string(),
+        title: name.to_string(),
+        metadata: serde_json::json!({}),
+        input,
+    })
+}
+
+/// opencode's name for tool `tool` of MCP server `server`
+/// (packages/opencode/src/mcp/catalog.ts `toolName`).
+fn mcp_tool_name(server: &str, tool: &str) -> String {
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect::<String>()
+    };
+    format!("{}_{}", sanitize(server), sanitize(tool))
+}
+
+/// Every file a Cline-family file tool names: `path`, native `files[].path`, or
+/// the XML protocol's `args.file[].path`.
+fn cline_file_paths(input: &serde_json::Value) -> Vec<String> {
+    let path_of = |v: &serde_json::Value| {
+        v.as_str()
+            .or_else(|| v.get("path").and_then(|p| p.as_str()))
+            .map(str::to_string)
+    };
+    let many = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::Array(items)) => items.iter().filter_map(path_of).collect(),
+        Some(one) => path_of(one).into_iter().collect(),
+        None => Vec::new(),
+    };
+    if let Some(p) = input.get("path").and_then(|p| p.as_str()) {
+        return vec![p.to_string()];
+    }
+    let files = many(input.get("files"));
+    if !files.is_empty() {
+        return files;
+    }
+    many(input.get("args").and_then(|a| a.get("file")))
+}
+
+/// The diff of a single-file `apply_diff` / `replace_in_file`: `diff`, or the
+/// XML protocol's `args.file.diff`, which may hold one or more
+/// `{ content, start_line }` with the content in a code fence or CDATA.
+fn cline_diff(input: &serde_json::Value) -> Option<String> {
+    if let Some(diff) = input.get("diff").and_then(|d| d.as_str()) {
+        return Some(diff.to_string());
+    }
+    let unwrap = |content: &str| {
+        let content = content.trim();
+        let content = content
+            .strip_prefix("<![CDATA[")
+            .and_then(|c| c.strip_suffix("]]>"))
+            .unwrap_or(content);
+        let content = content.trim();
+        match content.strip_prefix("```") {
+            Some(fenced) => {
+                let body = fenced.split_once('\n').map_or("", |(_, b)| b);
+                body.trim_end().strip_suffix("```").unwrap_or(body).to_string()
+            }
+            None => content.to_string(),
+        }
+    };
+    let one = |d: &serde_json::Value| match d {
+        serde_json::Value::String(s) => Some(unwrap(s)),
+        serde_json::Value::Object(_) => {
+            let content = unwrap(d.get("content")?.as_str()?);
+            let start = d.get("start_line").and_then(|s| s.as_str()).map(str::trim);
+            Some(match start {
+                Some(n) if !content.contains(":start_line:") => {
+                    content.replacen(" SEARCH\n", &format!(" SEARCH\n:start_line:{n}\n"), 1)
+                }
+                _ => content,
+            })
+        }
+        _ => None,
+    };
+    let diffs = match input.get("args")?.get("file")?.get("diff")? {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        single => vec![one(single)?],
+    };
+    (!diffs.is_empty()).then(|| diffs.join("\n"))
+}
+
+/// The SEARCH/REPLACE blocks of a Roo `apply_diff` or Cline `replace_in_file`
+/// diff, as `(start line, search, replace)`.
+fn search_replace_blocks(diff: &str) -> Vec<(usize, String, String)> {
+    enum State {
+        Outside,
+        Search,
+        Replace,
+    }
+    let mut blocks = Vec::new();
+    let (mut state, mut start, mut old, mut new) = (State::Outside, 1, Vec::new(), Vec::new());
+    for line in diff.lines() {
+        let marker = line.trim_end();
+        match state {
+            State::Outside => {
+                if marker.ends_with(" SEARCH")
+                    && (marker.starts_with("<<<<<<<") || marker.starts_with("-------"))
+                {
+                    (state, start, old, new) = (State::Search, 1, Vec::new(), Vec::new());
+                }
+            }
+            State::Search => {
+                if let Some(n) = marker.strip_prefix(":start_line:") {
+                    start = n.trim().parse().unwrap_or(1);
+                } else if marker.starts_with(":end_line:") || (marker == "-------" && old.is_empty()) {
+                } else if marker == "=======" {
+                    state = State::Replace;
+                } else {
+                    old.push(line);
+                }
+            }
+            State::Replace => {
+                if marker.ends_with(" REPLACE")
+                    && (marker.starts_with(">>>>>>>") || marker.starts_with("+++++++"))
+                {
+                    blocks.push((start, old.join("\n"), new.join("\n")));
+                    state = State::Outside;
+                } else {
+                    new.push(line);
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// A unified diff of SEARCH/REPLACE blocks, shaped like the patch opencode's
+/// edit tool records in its metadata (jsdiff `createTwoFilesPatch`).
+fn unified_diff(file: &str, blocks: &[(usize, String, String)]) -> String {
+    let mut out = format!(
+        "Index: {file}\n===================================================================\n--- {file}\n+++ {file}\n"
+    );
+    for (start, old, new) in blocks {
+        let old: Vec<&str> = if old.is_empty() { Vec::new() } else { old.split('\n').collect() };
+        let new: Vec<&str> = if new.is_empty() { Vec::new() } else { new.split('\n').collect() };
+        out.push_str(&format!("@@ -{start},{} +{start},{} @@\n", old.len(), new.len()));
+        for line in old {
+            out.push_str(&format!("-{line}\n"));
+        }
+        for line in new {
+            out.push_str(&format!("+{line}\n"));
+        }
+    }
+    out
+}
+
+/// Roo's markdown checklist (`[x] done`, `[-] doing`, `[ ] todo`) as opencode todos.
+fn cline_todos(list: &str) -> Vec<serde_json::Value> {
+    list.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches("- ").trim_start();
+            let (status, content) = if let Some(rest) = line.strip_prefix("[x]").or_else(|| line.strip_prefix("[X]")) {
+                ("completed", rest)
+            } else if let Some(rest) = line.strip_prefix("[-]") {
+                ("in_progress", rest)
+            } else if let Some(rest) = line.strip_prefix("[ ]") {
+                ("pending", rest)
+            } else {
+                return None;
+            };
+            Some(serde_json::json!({ "content": content.trim(), "status": status }))
+        })
+        .collect()
+}
+
+/// Inner text of every `<tag>...</tag>` in `text`.
+fn xml_values(text: &str, tag: &str) -> Vec<String> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        out.push(after[..end].trim().to_string());
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
+/// The user's answer in an `ask_followup_question` result (`<answer>...</answer>`).
+fn question_answer(output: &str) -> String {
+    xml_values(output, "answer")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| output.trim().to_string())
+}
+
+/// `path` made absolute against `directory` (lexically, `..` folded away) when
+/// it is relative and the directory is known.
+fn resolve_path(path: &str, directory: Option<&str>) -> String {
+    let absolute = path.starts_with(['/', '\\', '~'])
+        || path.as_bytes().get(1) == Some(&b':');
+    let Some(dir) = directory.filter(|_| !absolute) else {
+        return path.to_string();
+    };
+    let mut parts: Vec<&str> = dir.split('/').collect();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            c => parts.push(c),
+        }
+    }
+    let joined = parts.join("/");
+    if joined.is_empty() { "/".to_string() } else { joined }
 }
 
 /// `path` relative to the session directory when it lies inside it, as opencode
@@ -792,6 +1214,8 @@ mod tests {
             time_updated: 2000,
             directory: Some("/tmp".into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::System,
@@ -799,6 +1223,7 @@ mod tests {
                     time_created: 1000,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::User,
@@ -806,6 +1231,7 @@ mod tests {
                     time_created: 1001,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -820,6 +1246,7 @@ mod tests {
                     time_created: 1002,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     // Claude-style: tool result arrives in a following user message
@@ -833,6 +1260,7 @@ mod tests {
                     time_created: 1003,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
             ],
         };
@@ -882,6 +1310,7 @@ mod tests {
             time_created: 1000,
             origin: None,
             model,
+            summary: false,
         }
     }
 
@@ -915,6 +1344,8 @@ mod tests {
             time_updated: 2000,
             directory: Some(directory.into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         }
     }
@@ -1075,6 +1506,7 @@ mod tests {
             time_created,
             origin: None,
             model: None,
+            summary: false,
         };
         let call = |id: &str| Part::ToolCall {
             name: "Read".into(),
@@ -1095,6 +1527,8 @@ mod tests {
             time_updated: 1004,
             directory: Some("/tmp".into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 message(
                     Role::User,
@@ -1173,6 +1607,7 @@ mod tests {
             time_created: 1000,
             origin: Some(Agent::ClaudeCode),
             model: None,
+            summary: false,
         };
         let edit = serde_json::json!({
             "file_path": "/repo/src/a.rs",
@@ -1192,6 +1627,8 @@ mod tests {
             time_updated: 1000,
             directory: Some("/repo".into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 message(
                     Role::Assistant,
@@ -1273,6 +1710,8 @@ mod tests {
             time_updated: 1000,
             directory: None,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![Message {
                 role: Role::Assistant,
                 parts: vec![Part::ToolCall {
@@ -1283,6 +1722,7 @@ mod tests {
                 time_created: 1000,
                 origin: None,
                 model: None,
+                summary: false,
             }],
         };
         let dir =
@@ -1324,6 +1764,99 @@ mod tests {
         assert_ne!(other["info"]["id"], first["info"]["id"]);
         assert_ne!(other["messages"][0]["info"]["id"], first["messages"][0]["info"]["id"]);
         assert_eq!(other["info"]["title"], "[import:roo] Real title");
+    }
+
+    #[test]
+    fn write_maps_cline_tools_summaries_and_subtasks() {
+        let call = |name: &str, id: &str, input: serde_json::Value| Part::ToolCall {
+            name: name.into(),
+            id: Some(id.into()),
+            input: Some(input),
+        };
+        let result = |id: &str, output: &str| Part::ToolResult {
+            name: "tool".into(),
+            id: Some(id.into()),
+            output: Some(output.into()),
+            is_error: None,
+        };
+        let message = |role, parts, summary| Message {
+            role,
+            parts,
+            time_created: 1000,
+            origin: Some(Agent::Cline),
+            model: None,
+            summary,
+        };
+        let diff = "<<<<<<< SEARCH\n:start_line:3\n-------\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let mut session = session_in(
+            "/repo",
+            vec![
+                message(
+                    Role::Assistant,
+                    vec![
+                        call("execute_command", "c1", serde_json::json!({ "command": "ls", "cwd": "sub" })),
+                        call("read_file", "c2", serde_json::json!({ "args": { "file": { "path": "../x/a.rs" } } })),
+                        call("apply_diff", "c3", serde_json::json!({ "path": "a.rs", "diff": diff })),
+                        call("update_todo_list", "c4", serde_json::json!({ "todos": "[x] one\n[-] two\n[ ] three" })),
+                        call("ask_followup_question", "c5", serde_json::json!({ "question": "Which?", "follow_up": "<suggest>A</suggest>\n<suggest>B</suggest>" })),
+                        call("new_task", "c6", serde_json::json!({ "mode": "code", "message": "Do the sub thing\nin detail" })),
+                        call("use_mcp_tool", "c7", serde_json::json!({ "server_name": "dh.serper", "tool_name": "search", "arguments": "{\"q\":1}" })),
+                        call("browser_action", "c8", serde_json::json!({ "action": "launch" })),
+                    ],
+                    false,
+                ),
+                message(
+                    Role::User,
+                    vec![result("c1", "a.rs"), result("c5", "<answer>\nB\n</answer>")],
+                    false,
+                ),
+                message(Role::Assistant, vec![Part::text("## Summary")], true),
+            ],
+        );
+        session.origin = Agent::Cline;
+        session.parent = Some("parent-task".into());
+        session.children = vec!["child-task".into()];
+        let export = write_export(&session, "cline-tools");
+
+        let parts = &export["messages"][0]["parts"];
+        let tool = |i: usize| (parts[i]["tool"].as_str().unwrap(), &parts[i]["state"]);
+        assert_eq!(tool(0).0, "bash");
+        assert_eq!(tool(0).1["input"], serde_json::json!({ "command": "ls", "workdir": "/repo/sub" }));
+        assert_eq!(tool(0).1["metadata"]["output"], "a.rs");
+        assert_eq!(tool(1).0, "read");
+        assert_eq!(tool(1).1["input"]["filePath"], "/x/a.rs");
+        assert_eq!(tool(2).0, "edit");
+        assert_eq!(
+            tool(2).1["input"],
+            serde_json::json!({ "filePath": "/repo/a.rs", "oldString": "old", "newString": "new" })
+        );
+        assert!(tool(2).1["metadata"]["diff"].as_str().unwrap().ends_with("@@ -3,1 +3,1 @@\n-old\n+new\n"));
+        assert_eq!(tool(3).0, "todowrite");
+        assert_eq!(tool(3).1["metadata"]["todos"][1], serde_json::json!({ "content": "two", "status": "in_progress" }));
+        assert_eq!(tool(4).0, "question");
+        assert_eq!(tool(4).1["input"]["questions"][0]["options"][1]["label"], "B");
+        assert_eq!(tool(4).1["metadata"]["answers"], serde_json::json!([["B"]]));
+        assert_eq!(tool(5).0, "task");
+        assert_eq!(tool(5).1["input"]["description"], "Do the sub thing");
+        assert_eq!(tool(5).1["metadata"]["sessionId"], IdGen::session_id("cline:child-task"));
+        assert_eq!(tool(6).0, "dh_serper_search");
+        assert_eq!(tool(6).1["input"], serde_json::json!({ "q": 1 }));
+        assert_eq!(tool(7).0, "browser_action", "no opencode equivalent: left as is");
+
+        assert_eq!(export["info"]["parentID"], IdGen::session_id("cline:parent-task"));
+        let msgs = export["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "the result-only message folds away; the summary adds one");
+        let (compaction, summary) = (&msgs[1], &msgs[2]);
+        assert_eq!(compaction["info"]["role"], "user");
+        assert_eq!(compaction["parts"][0]["type"], "compaction");
+        assert_eq!(summary["info"]["summary"], true);
+        assert_eq!(summary["info"]["finish"], "stop");
+        assert_eq!(
+            msgs[0]["info"]["finish"], "tool-calls",
+            "a reply that ends calling tools is finished, so opencode checks its size"
+        );
+        assert_eq!(summary["info"]["parentID"], compaction["info"]["id"]);
+        assert!(compaction["info"]["id"].as_str() < summary["info"]["id"].as_str());
     }
 
     #[test]

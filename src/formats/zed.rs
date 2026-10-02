@@ -129,6 +129,7 @@ impl Format for Zed {
                 time_created: ts,
                 origin: Some(Agent::Zed),
                 model: None,
+                summary: false,
             });
             ts += 1;
         }
@@ -157,6 +158,8 @@ impl Format for Zed {
             time_updated: now,
             directory: None,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         })
     }
@@ -321,6 +324,8 @@ mod tests {
             time_updated: 0,
             directory: None,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -328,6 +333,7 @@ mod tests {
                     time_created: 0,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -349,6 +355,7 @@ mod tests {
                     time_created: 1,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
             ],
         };
