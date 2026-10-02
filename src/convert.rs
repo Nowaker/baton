@@ -7,17 +7,32 @@ use anyhow::Context;
 use crate::canonical::{Agent, Session};
 use crate::formats;
 
+/// Adjustments applied to the session between reading and writing it.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Lossy: strip all tool calls and tool outputs.
+    pub compress: bool,
+    /// `(from, to)` path prefixes, see [`Session::map_paths`].
+    pub path_maps: Vec<(String, String)>,
+    /// Replaces the target's default title prefix.
+    pub title_prefix: Option<String>,
+}
+
 /// Returns the path the converted session was written to.
 pub fn convert(
     from: Agent,
     to: Agent,
     input: &Path,
     output: Option<&Path>,
-    compress: bool,
+    options: &Options,
 ) -> anyhow::Result<std::path::PathBuf> {
     let mut session = formats::read(from, input)
         .with_context(|| format!("reading {} session", from))?;
-    if compress {
+    session.map_paths(&options.path_maps);
+    if options.title_prefix.is_some() {
+        session.title_prefix.clone_from(&options.title_prefix);
+    }
+    if options.compress {
         let before = session.message_count();
         session.compress();
         eprintln!(

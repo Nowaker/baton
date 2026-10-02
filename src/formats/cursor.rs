@@ -124,6 +124,7 @@ impl Format for Cursor {
             time_created: now,
             time_updated: now,
             directory: None,
+            title_prefix: None,
             messages,
         })
     }
