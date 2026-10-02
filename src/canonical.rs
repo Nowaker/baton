@@ -47,7 +47,8 @@ impl Agent {
             "codex" => Agent::Codex,
             "cursor" => Agent::Cursor,
             "continue" => Agent::Continue,
-            "cline" | "roo" | "roo-code" | "roocode" => Agent::Cline,
+            "cline" | "roo" | "roo-code" | "roocode" | "kilo" | "kilo-code" | "kilocode" | "zoo"
+            | "zoo-code" | "zoocode" => Agent::Cline,
             "zed" => Agent::Zed,
             "aider" => Agent::Aider,
             "gemini" | "gemini-cli" => Agent::GeminiCli,
@@ -142,6 +143,11 @@ pub struct Message {
     /// Model that produced this message, when the source format records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    /// A summary the agent wrote to stand in for everything before it once the
+    /// context filled up; the agent kept sending only the summary and what
+    /// follows it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary: bool,
 }
 
 /// A model as a provider id plus that provider's model id, e.g. `anthropic` +
@@ -182,6 +188,12 @@ pub struct Session {
     /// keeps the target's own default, which for opencode is `[<origin>] `.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_prefix: Option<String>,
+    /// Source id of the session that spawned this one as a subtask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Source ids of the subtask sessions this one spawned, in spawn order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
     pub messages: Vec<Message>,
 }
 
@@ -394,6 +406,8 @@ mod tests {
             time_updated: 0,
             directory: Some("/Users/me/projects/app".into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![Message {
                 role: Role::Assistant,
                 parts: vec![
@@ -414,6 +428,7 @@ mod tests {
                 time_created: 0,
                 origin: None,
                 model: None,
+                summary: false,
             }],
         };
         session.map_paths(&[
@@ -440,6 +455,8 @@ mod tests {
     fn agent_parse_aliases() {
         assert_eq!(Agent::parse("Claude Code"), Some(Agent::ClaudeCode));
         assert_eq!(Agent::parse("roo"), Some(Agent::Cline));
+        assert_eq!(Agent::parse("kilo"), Some(Agent::Cline));
+        assert_eq!(Agent::parse("zoo"), Some(Agent::Cline));
         assert_eq!(Agent::parse("gemini"), Some(Agent::GeminiCli));
         assert_eq!(Agent::parse("nope"), None);
     }

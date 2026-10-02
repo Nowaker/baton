@@ -100,6 +100,7 @@ impl Format for ClaudeCode {
                                 provider: "anthropic".to_string(),
                                 id,
                             }),
+                        summary: false,
                     });
                 }
                 _ => continue,
@@ -114,6 +115,8 @@ impl Format for ClaudeCode {
             time_updated: last_ts,
             directory,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         };
         session.title = match custom_title.or(ai_title) {
@@ -601,6 +604,8 @@ mod tests {
             time_updated: 1000,
             directory: None,
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![Message {
                 role: Role::User,
                 parts: vec![
@@ -614,6 +619,7 @@ mod tests {
                 time_created: 1000,
                 origin: None,
                 model: None,
+                summary: false,
             }],
         };
         ClaudeCode::write(&session, &path).unwrap();
@@ -651,6 +657,8 @@ mod tests {
             time_updated: 2000,
             directory: Some("/tmp".into()),
             title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -658,6 +666,7 @@ mod tests {
                     time_created: 1000,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -672,6 +681,7 @@ mod tests {
                     time_created: 1001,
                     origin: None,
                     model: None,
+                    summary: false,
                 },
             ],
         };
