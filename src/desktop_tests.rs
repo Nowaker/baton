@@ -9,6 +9,7 @@ fn session() -> Session {
         time_created: 1_700_000_000_000,
         time_updated: 1_700_000_001_000,
         directory: None,
+        title_prefix: None,
         messages: Vec::new(),
     }
 }
